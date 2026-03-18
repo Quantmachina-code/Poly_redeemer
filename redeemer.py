@@ -286,12 +286,13 @@ def redeem_condition(
     tok_map:         dict[int, int],   # token_id → indexSet
     nonce:           int,
     token_to_market: dict[str, dict] | None = None,
+    wallet:          str | None = None,
 ) -> tuple[Optional[str], int]:
     """
     Attempt to redeem all positions in *cond_id* that have a non-zero balance.
     Returns (tx_hash_hex_or_None, next_nonce).
     """
-    wallet = account.address
+    wallet = wallet or account.address
     cond_b = hex_to_bytes32(cond_id)
 
     # Resolve a human-readable market label for this condition
@@ -371,8 +372,8 @@ def redeem_condition(
 
 # ── One full redemption cycle ─────────────────────────────────────────────────
 
-def run_once(w3: Web3, ctf, account: Account) -> None:
-    wallet = account.address
+def run_once(w3: Web3, ctf, account: Account, wallet: str | None = None) -> None:
+    wallet = wallet or account.address
     log.info("── Scanning wallet %s ──", wallet)
 
     # 1. Fetch positions
@@ -406,12 +407,12 @@ def run_once(w3: Web3, ctf, account: Account) -> None:
     log.info("Checking resolution status …")
 
     # 4. Iterate; maintain a running nonce for any txs sent this cycle
-    nonce    = w3.eth.get_transaction_count(wallet, "pending")
+    nonce    = w3.eth.get_transaction_count(account.address, "pending")
     redeemed = 0
 
     for cond_id, tok_map in by_condition.items():
         tx_hash, nonce = redeem_condition(
-            w3, ctf, account, cond_id, tok_map, nonce, token_to_market
+            w3, ctf, account, cond_id, tok_map, nonce, token_to_market, wallet
         )
         if tx_hash:
             redeemed += 1
@@ -468,7 +469,7 @@ def main() -> None:
 
     while True:
         try:
-            run_once(w3, ctf, account)
+            run_once(w3, ctf, account, wallet_address)
         except KeyboardInterrupt:
             log.info("Interrupted — exiting.")
             sys.exit(0)
