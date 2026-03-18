@@ -153,30 +153,23 @@ def _get(url: str, params: dict | None = None) -> Optional[list | dict]:
 
 def fetch_user_positions(address: str) -> list[dict]:
     """
-    Fetch all positions for *address* from the Polymarket Data API.
-
-    Returns a list of position dicts. Each dict may contain:
-        asset_id / tokenId / token_id  — ERC-1155 token ID (as string)
-        conditionId / condition_id     — CTF condition ID (0x-prefixed hex)
-        outcome                        — "Yes" / "No"
-        size                           — position size in shares
+    Fetch positions for *address* from the Polymarket Data API,
+    returning only those flagged redeemable=true with a non-dust size.
     """
     data = _get(f"{DATA_API}/positions", {
         "user":           address,
-        "sizeThreshold":  "0",
+        "sizeThreshold":  "0.01",
         "limit":          500,
     })
-    if isinstance(data, list):
-        if data:
-            log.debug("Position record sample keys: %s", list(data[0].keys()))
-        return data
-    # Some API versions wrap the list in a 'data' key
     if isinstance(data, dict):
-        inner = data.get("data") or data.get("positions") or []
-        if inner:
-            log.debug("Position record sample keys: %s", list(inner[0].keys()))
-        return inner
-    return []
+        data = data.get("data") or data.get("positions") or []
+    if not isinstance(data, list):
+        return []
+    if data:
+        log.debug("Position record sample keys: %s", list(data[0].keys()))
+    redeemable = [p for p in data if p.get("redeemable") is True]
+    log.debug("%d/%d positions flagged redeemable by API.", len(redeemable), len(data))
+    return redeemable
 
 
 def fetch_markets_by_tokens(token_ids: list[str]) -> list[dict]:
@@ -333,6 +326,7 @@ def redeem_condition(
     nonce:           int,
     token_to_market: dict[str, dict] | None = None,
     wallet:          str | None = None,
+    api_confirmed:   bool = False,     # True when API already verified redeemable=True
 ) -> tuple[Optional[str], int]:
     """
     Attempt to redeem all positions in *cond_id* that have a non-zero balance.
@@ -354,18 +348,22 @@ def redeem_condition(
 
     log.info("  Condition %s  %s", cond_id[:20] + "…", mkt_label if mkt_label != cond_id[:20] + "…" else "")
 
-    # Check on-chain resolution
-    try:
-        denom = ctf.functions.payoutDenominator(cond_b).call()
-    except Exception as exc:
-        log.warning("    payoutDenominator failed: %s", exc)
-        return None, nonce
+    if api_confirmed:
+        # API already confirmed redeemable=True — skip the RPC call
+        log.info("    status : RESOLVED  (confirmed by Data API)")
+    else:
+        # Fall back to on-chain resolution check
+        try:
+            denom = ctf.functions.payoutDenominator(cond_b).call()
+        except Exception as exc:
+            log.warning("    payoutDenominator failed: %s", exc)
+            return None, nonce
 
-    if denom == 0:
-        log.info("    status : PENDING  (not resolved on-chain yet)")
-        return None, nonce
+        if denom == 0:
+            log.info("    status : PENDING  (not resolved on-chain yet)")
+            return None, nonce
 
-    log.info("    status : RESOLVED  (payoutDenominator=%s)", denom)
+        log.info("    status : RESOLVED  (payoutDenominator=%s)", denom)
 
     # Find positions with non-zero CTF balance
     redeemable: list[int] = []
@@ -445,10 +443,11 @@ def run_once(w3: Web3, ctf, account: Account, wallet: str | None = None) -> None
     wallet = wallet or account.address
     log.info("── Scanning wallet %s ──", wallet)
 
-    # 1. Fetch positions
+    # 1. Fetch positions (API pre-filtered: redeemable=True, size ≥ 0.01)
     positions = fetch_user_positions(wallet)
-    log.info("Data API returned %d position record(s).", len(positions))
+    log.info("Data API returned %d redeemable position record(s).", len(positions))
     if not positions:
+        log.info("Nothing to redeem this cycle.")
         return
 
     # 2. Resolve any missing market metadata in a single batch request
@@ -461,7 +460,7 @@ def run_once(w3: Web3, ctf, account: Account, wallet: str | None = None) -> None
         return
 
     # ── Summary of found positions ────────────────────────────────────────────
-    log.info("Found %d condition(s) with positions:", len(by_condition))
+    log.info("Found %d condition(s) to redeem:", len(by_condition))
     for cond_id, tok_map in by_condition.items():
         mkt_name = None
         for tok_id in tok_map:
@@ -473,15 +472,14 @@ def run_once(w3: Web3, ctf, account: Account, wallet: str | None = None) -> None
         label = f'"{mkt_name}"' if mkt_name else "(market unknown)"
         log.info("  • %s  %s  (%d token(s))", cond_id[:20] + "…", label, len(tok_map))
 
-    log.info("Checking resolution status …")
-
     # 4. Iterate; maintain a running nonce for any txs sent this cycle
     nonce    = w3.eth.get_transaction_count(account.address, "pending")
     redeemed = 0
 
     for cond_id, tok_map in by_condition.items():
         tx_hash, nonce = redeem_condition(
-            w3, ctf, account, cond_id, tok_map, nonce, token_to_market, wallet
+            w3, ctf, account, cond_id, tok_map, nonce, token_to_market, wallet,
+            api_confirmed=True,
         )
         if tx_hash:
             redeemed += 1
