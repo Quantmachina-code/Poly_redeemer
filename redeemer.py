@@ -179,7 +179,8 @@ def build_token_to_market_map(positions: list[dict]) -> dict[str, dict]:
         cond = pos.get("conditionId") or pos.get("condition_id")
         if not cond:
             tok = str(
-                pos.get("asset_id")
+                pos.get("asset")
+                or pos.get("asset_id")
                 or pos.get("tokenId")
                 or pos.get("token_id")
                 or ""
@@ -239,8 +240,10 @@ def build_condition_map(
 
     for pos in positions:
         # --- resolve token ID ---
+        # Data API uses "asset"; older/other formats use asset_id / tokenId / token_id
         tok_raw = (
-            pos.get("asset_id")
+            pos.get("asset")
+            or pos.get("asset_id")
             or pos.get("tokenId")
             or pos.get("token_id")
         )
@@ -264,21 +267,26 @@ def build_condition_map(
         # --- resolve indexSet ---
         idx = pos.get("indexSet") or pos.get("index_set")
         if idx is None:
-            outcome = str(pos.get("outcome") or "").strip().lower()
-            if outcome in ("yes", "1"):
-                idx = 1
-            elif outcome in ("no", "2"):
-                idx = 2
+            # Data API provides outcomeIndex (0-based); indexSet = 1 << outcomeIndex
+            outcome_index = pos.get("outcomeIndex")
+            if outcome_index is not None:
+                idx = 1 << int(outcome_index)
             else:
-                # Derive from Gamma market token ordering
-                mkt = token_to_market.get(tok_str)
-                if not mkt:
-                    mkt = next(
-                        (m for m in token_to_market.values()
-                         if m.get("conditionId") == cond_id),
-                        None,
-                    )
-                idx = index_set_for_token(mkt, tok_str) if mkt else None
+                outcome = str(pos.get("outcome") or "").strip().lower()
+                if outcome in ("yes", "1"):
+                    idx = 1
+                elif outcome in ("no", "2"):
+                    idx = 2
+                else:
+                    # Derive from Gamma market token ordering
+                    mkt = token_to_market.get(tok_str)
+                    if not mkt:
+                        mkt = next(
+                            (m for m in token_to_market.values()
+                             if m.get("conditionId") == cond_id),
+                            None,
+                        )
+                    idx = index_set_for_token(mkt, tok_str) if mkt else None
 
         if idx is None:
             log.debug("Cannot determine indexSet for token %s; skipping.", tok_str)
