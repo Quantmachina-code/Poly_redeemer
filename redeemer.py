@@ -140,10 +140,15 @@ def fetch_user_positions(address: str) -> list[dict]:
         "limit":          500,
     })
     if isinstance(data, list):
+        if data:
+            log.debug("Position record sample keys: %s", list(data[0].keys()))
         return data
     # Some API versions wrap the list in a 'data' key
     if isinstance(data, dict):
-        return data.get("data") or data.get("positions") or []
+        inner = data.get("data") or data.get("positions") or []
+        if inner:
+            log.debug("Position record sample keys: %s", list(inner[0].keys()))
+        return inner
     return []
 
 
@@ -185,14 +190,19 @@ def build_token_to_market_map(positions: list[dict]) -> dict[str, dict]:
     if not unknown_tokens:
         return {}
 
+    log.debug("Gamma lookup: %d unique token IDs", len(set(unknown_tokens)))
     markets = fetch_markets_by_tokens(list(set(unknown_tokens)))
+    log.debug("Gamma returned %d market(s)", len(markets))
+    if markets:
+        log.debug("Market sample keys: %s", list(markets[0].keys()))
     mapping: dict[str, dict] = {}
     for mkt in markets:
-        tokens = mkt.get("tokens") or []
+        tokens = mkt.get("tokens") or mkt.get("clobTokenIds") or []
         for tok in tokens:
             tid = str(tok.get("token_id", "") if isinstance(tok, dict) else tok)
             if tid:
                 mapping[tid] = mkt
+    log.debug("token→market map: %d entries", len(mapping))
     return mapping
 
 
@@ -246,8 +256,9 @@ def build_condition_map(
             if not mkt:
                 log.debug("No market found for token %s; skipping.", tok_str)
                 continue
-            cond_id = mkt.get("conditionId")
+            cond_id = mkt.get("conditionId") or mkt.get("condition_id")
         if not cond_id:
+            log.debug("No conditionId for token %s; skipping.", tok_str)
             continue
 
         # --- resolve indexSet ---
