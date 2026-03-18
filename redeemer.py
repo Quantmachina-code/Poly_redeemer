@@ -86,6 +86,13 @@ PROXY_ABI = [
         "stateMutability": "nonpayable",
         "type": "function",
     },
+    {
+        "inputs": [],
+        "name": "owner",
+        "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
 
 # ── CTF ABI (only the functions we need) ──────────────────────────────────────
@@ -405,8 +412,12 @@ def redeem_condition(
 
     try:
         gas = fn.estimate_gas({"from": sender}) + 60_000
-    except Exception:
-        gas = 350_000
+    except Exception as gas_exc:
+        log.error("    gas estimation failed (tx would revert): %s", gas_exc)
+        log.error("    Possible causes:")
+        log.error("      1. The signing EOA is not the proxy owner — check owner() on Polygonscan.")
+        log.error("      2. The EOA has no POL for gas — fund %s with ~0.5 POL.", sender)
+        return None, nonce
 
     tx = fn.build_transaction({
         "from":     sender,
@@ -524,6 +535,41 @@ def main() -> None:
     log.info("Connected to Polygon (chain_id=%s)", w3.eth.chain_id)
 
     ctf = w3.eth.contract(address=CTF_ADDRESS, abi=CTF_ABI)
+
+    # ── Startup diagnostics ───────────────────────────────────────────────────
+    eoa = account.address
+    pol_balance_wei = w3.eth.get_balance(eoa)
+    pol_balance     = w3.from_wei(pol_balance_wei, "ether")
+    log.info("  EOA      : %s  (POL balance: %s)", eoa, pol_balance)
+    if pol_balance_wei < w3.to_wei(0.01, "ether"):
+        log.warning(
+            "  ⚠ EOA has very little POL (%.6f). "
+            "Send at least 0.5 POL to %s to cover gas.",
+            pol_balance, eoa,
+        )
+
+    if wallet_address.lower() != eoa.lower():
+        # Proxy mode — verify the EOA is the authorised owner of the proxy
+        try:
+            proxy_contract = w3.eth.contract(
+                address=wallet_address, abi=PROXY_ABI
+            )
+            proxy_owner = proxy_contract.functions.owner().call()
+            if proxy_owner.lower() == eoa.lower():
+                log.info(
+                    "  Proxy    : %s  owner=EOA ✓", wallet_address
+                )
+            else:
+                log.error(
+                    "  ✗ PROXY OWNER MISMATCH — proxy owner is %s "
+                    "but signing EOA is %s. "
+                    "execute() will revert until you set POLY_PRIVATE_KEY "
+                    "to the private key for %s.",
+                    proxy_owner, eoa, proxy_owner,
+                )
+        except Exception as exc:
+            log.warning("  Could not read proxy owner(): %s", exc)
+    log.info("─" * 55)
 
     while True:
         try:
