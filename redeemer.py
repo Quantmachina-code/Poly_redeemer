@@ -22,6 +22,7 @@ Requirements:
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
@@ -389,6 +390,19 @@ def run_once(w3: Web3, ctf, account: Account) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Polymarket auto-redeemer")
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        default=os.getenv("VERBOSE", "").lower() in ("1", "true", "yes"),
+        help="Enable debug logging (also via VERBOSE=true in .env)",
+    )
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        log.debug("Debug logging enabled.")
+
     if not POLY_PRIVATE_KEY:
         log.error(
             "POLY_PRIVATE_KEY is not set.\n"
