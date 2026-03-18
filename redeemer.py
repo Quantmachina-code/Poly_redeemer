@@ -279,12 +279,13 @@ def build_condition_map(
 
 
 def redeem_condition(
-    w3:       Web3,
+    w3:              Web3,
     ctf,
-    account:  Account,
-    cond_id:  str,
-    tok_map:  dict[int, int],   # token_id → indexSet
-    nonce:    int,
+    account:         Account,
+    cond_id:         str,
+    tok_map:         dict[int, int],   # token_id → indexSet
+    nonce:           int,
+    token_to_market: dict[str, dict] | None = None,
 ) -> tuple[Optional[str], int]:
     """
     Attempt to redeem all positions in *cond_id* that have a non-zero balance.
@@ -293,18 +294,31 @@ def redeem_condition(
     wallet = account.address
     cond_b = hex_to_bytes32(cond_id)
 
+    # Resolve a human-readable market label for this condition
+    mkt_label = cond_id[:20] + "…"
+    if token_to_market:
+        for tok_id in tok_map:
+            mkt = token_to_market.get(str(tok_id))
+            if mkt:
+                name = mkt.get("question") or mkt.get("title") or mkt.get("slug")
+                if name:
+                    mkt_label = f'"{name}"'
+                break
+
+    log.info("  Condition %s  %s", cond_id[:20] + "…", mkt_label if mkt_label != cond_id[:20] + "…" else "")
+
     # Check on-chain resolution
     try:
         denom = ctf.functions.payoutDenominator(cond_b).call()
     except Exception as exc:
-        log.warning("payoutDenominator(%s…): %s", cond_id[:16], exc)
+        log.warning("    payoutDenominator failed: %s", exc)
         return None, nonce
 
     if denom == 0:
-        log.debug("Condition %s… not resolved yet.", cond_id[:16])
+        log.info("    status : PENDING  (not resolved on-chain yet)")
         return None, nonce
 
-    log.info("Condition %s… RESOLVED (denom=%s).", cond_id[:20], denom)
+    log.info("    status : RESOLVED  (payoutDenominator=%s)", denom)
 
     # Find positions with non-zero CTF balance
     redeemable: list[int] = []
@@ -312,14 +326,17 @@ def redeem_condition(
         try:
             bal = ctf.functions.balanceOf(wallet, tok_id).call()
         except Exception as exc:
-            log.warning("balanceOf(token=%s): %s", tok_id, exc)
+            log.warning("    balanceOf(token=%s): %s", tok_id, exc)
             continue
+        outcome_label = "YES" if idx_set == 1 else ("NO" if idx_set == 2 else f"idx={idx_set}")
         if bal > 0:
-            log.info("  token %-42s  indexSet=%s  balance=%s", tok_id, idx_set, bal)
+            log.info("    token %s  %-3s  balance=%s  → REDEEMABLE", tok_id, outcome_label, bal)
             redeemable.append(idx_set)
+        else:
+            log.info("    token %s  %-3s  balance=0   → already claimed / no position", tok_id, outcome_label)
 
     if not redeemable:
-        log.info("  → No redeemable balance (already claimed or zero position).")
+        log.info("    result : nothing to redeem.")
         return None, nonce
 
     # Build redeemPositions transaction
@@ -345,10 +362,10 @@ def redeem_condition(
 
     try:
         tx_hash = w3.eth.send_raw_transaction(raw_tx)
-        log.info("  ✓ tx sent: %s", tx_hash.hex())
+        log.info("    result : REDEEMED  tx=%s", tx_hash.hex())
         return tx_hash.hex(), nonce + 1
     except Exception as exc:
-        log.error("  send_raw_transaction failed: %s", exc)
+        log.error("    result : send_raw_transaction failed: %s", exc)
         return None, nonce
 
 
@@ -373,18 +390,36 @@ def run_once(w3: Web3, ctf, account: Account) -> None:
         log.info("No positions with identifiable conditions.")
         return
 
-    log.info("Checking %d condition(s) …", len(by_condition))
+    # ── Summary of found positions ────────────────────────────────────────────
+    log.info("Found %d condition(s) with positions:", len(by_condition))
+    for cond_id, tok_map in by_condition.items():
+        mkt_name = None
+        for tok_id in tok_map:
+            mkt = token_to_market.get(str(tok_id))
+            if mkt:
+                mkt_name = mkt.get("question") or mkt.get("title") or mkt.get("slug")
+                if mkt_name:
+                    break
+        label = f'"{mkt_name}"' if mkt_name else "(market unknown)"
+        log.info("  • %s  %s  (%d token(s))", cond_id[:20] + "…", label, len(tok_map))
+
+    log.info("Checking resolution status …")
 
     # 4. Iterate; maintain a running nonce for any txs sent this cycle
     nonce    = w3.eth.get_transaction_count(wallet, "pending")
     redeemed = 0
 
     for cond_id, tok_map in by_condition.items():
-        tx_hash, nonce = redeem_condition(w3, ctf, account, cond_id, tok_map, nonce)
+        tx_hash, nonce = redeem_condition(
+            w3, ctf, account, cond_id, tok_map, nonce, token_to_market
+        )
         if tx_hash:
             redeemed += 1
 
-    log.info("Cycle complete — %d redemption(s) submitted.", redeemed)
+    log.info(
+        "Cycle complete — %d/%d condition(s) redeemed.",
+        redeemed, len(by_condition),
+    )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
