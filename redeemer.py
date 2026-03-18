@@ -14,9 +14,16 @@ How it works:
     4. Check the wallet's ERC-1155 CTF token balance for that position.
     5. If both resolved and non-zero balance, call redeemPositions() on the CTF contract.
 
+Proxy wallet architecture:
+    Polymarket proxy wallets are EIP-1167 minimal proxies created by a factory.
+    To execute transactions through a proxy, the EOA calls:
+        ProxyWalletFactory.proxy([{typeCode:1, to:CTF, value:0, data:calldata}])
+    The factory routes the call through the user's proxy wallet so that
+    msg.sender == proxy when CTF.redeemPositions() executes.
+
 Requirements:
     • POLY_PRIVATE_KEY must be set in .env (0x-prefixed private key).
-    • A small MATIC balance for gas is required (~$0.001 per redemption).
+    • A small POL balance for gas is required (~$0.001 per redemption).
     • Works with standard binary YES/NO Polymarket markets.
 """
 
@@ -60,6 +67,14 @@ POLY_USDC_ADDRESS = Web3.to_checksum_address(
 # Gnosis Conditional Token Framework — holds all Polymarket outcome tokens
 CTF_ADDRESS = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
 
+# ProxyWalletFactory — routes transactions through a user's proxy wallet.
+# The EOA calls proxy_factory.proxy([{typeCode, to, value, data}]) and the
+# factory executes the sub-call with msg.sender == the user's proxy wallet.
+PROXY_FACTORY_ADDRESS = Web3.to_checksum_address("0xaB45c5A4B0c941a2F231C04C3f49182e1A254052")
+
+# CTF Exchange — used only to look up the proxy wallet address for a given EOA.
+EXCHANGE_ADDRESS = Web3.to_checksum_address("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E")
+
 # ── API endpoints ─────────────────────────────────────────────────────────────
 DATA_API  = "https://data-api.polymarket.com"   # positions for a wallet
 GAMMA_API = "https://gamma-api.polymarket.com"  # market metadata
@@ -68,35 +83,39 @@ GAMMA_API = "https://gamma-api.polymarket.com"  # market metadata
 REDEEM_INTERVAL_S = int(os.getenv("REDEEM_INTERVAL_S", str(5 * 60)))  # 5 min default
 HTTP_TIMEOUT      = 20  # seconds per API call
 
-# ── Polymarket proxy wallet ABI (minimal) ────────────────────────────────────
-# Polymarket proxy wallets are Gnosis Safe-based contracts deployed by the
-# factory at 0x7BC41F2E80AaF83f971ED557F0C277E4Aa9054A7.
-# execute() takes 4 args (to, value, data, operation); operation=0 is a CALL.
-PROXY_ABI = [
+# ── ProxyWalletFactory ABI (minimal) ─────────────────────────────────────────
+# The factory at PROXY_FACTORY_ADDRESS knows each EOA's proxy wallet and
+# executes sub-calls with msg.sender == the proxy.
+PROXY_FACTORY_ABI = [
     {
+        "constant": False,
         "inputs": [
-            {"internalType": "address", "name": "to",        "type": "address"},
-            {"internalType": "uint256", "name": "value",     "type": "uint256"},
-            {"internalType": "bytes",   "name": "data",      "type": "bytes"},
-            {"internalType": "uint8",   "name": "operation", "type": "uint8"},
+            {
+                "components": [
+                    {"name": "typeCode", "type": "uint8"},
+                    {"name": "to",       "type": "address"},
+                    {"name": "value",    "type": "uint256"},
+                    {"name": "data",     "type": "bytes"},
+                ],
+                "name": "calls",
+                "type": "tuple[]",
+            }
         ],
-        "name": "execute",
-        "outputs": [],
-        "stateMutability": "nonpayable",
+        "name": "proxy",
+        "outputs": [{"name": "returnValues", "type": "bytes[]"}],
+        "payable": True,
+        "stateMutability": "payable",
         "type": "function",
     },
-    # Gnosis Safe owner checks
+]
+
+# ── CTF Exchange ABI (minimal) ────────────────────────────────────────────────
+# Used only to derive the proxy wallet address for a given EOA.
+EXCHANGE_ABI = [
     {
-        "inputs": [{"internalType": "address", "name": "owner", "type": "address"}],
-        "name": "isOwner",
-        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [],
-        "name": "getOwners",
-        "outputs": [{"internalType": "address[]", "name": "", "type": "address[]"}],
+        "inputs": [{"internalType": "address", "name": "user", "type": "address"}],
+        "name": "getPolyProxyWalletAddress",
+        "outputs": [{"internalType": "address", "name": "", "type": "address"}],
         "stateMutability": "view",
         "type": "function",
     },
@@ -327,6 +346,7 @@ def build_condition_map(
 def redeem_condition(
     w3:              Web3,
     ctf,
+    proxy_factory,
     account:         Account,
     cond_id:         str,
     tok_map:         dict[int, int],   # token_id → indexSet
@@ -392,44 +412,66 @@ def redeem_condition(
         return None, nonce
 
     # Build redeemPositions transaction
-    parent   = b"\x00" * 32
-    eoa      = account.address
+    parent    = b"\x00" * 32
+    eoa       = account.address
     use_proxy = wallet.lower() != eoa.lower()
 
     if use_proxy:
-        # The CTF tokens are held by the proxy wallet contract.
-        # The EOA calls proxy.execute(CTF, 0, redeemPositions calldata).
+        # Tokens are held by the proxy wallet.  To redeem them we call
+        # ProxyWalletFactory.proxy([{typeCode:1, to:CTF, value:0, data:calldata}])
+        # from the EOA.  The factory executes the sub-call with msg.sender == proxy.
         redeem_calldata = ctf.encode_abi(
             "redeemPositions",
             args=[POLY_USDC_ADDRESS, parent, cond_b, redeemable],
         )
-        proxy   = w3.eth.contract(
-            address=Web3.to_checksum_address(wallet), abi=PROXY_ABI
-        )
-        fn      = proxy.functions.execute(CTF_ADDRESS, 0, redeem_calldata, 0)  # operation=0 → CALL
-        sender  = eoa
-        log.debug("    routing via proxy wallet %s", wallet)
+        # Estimate gas simulating the proxy calling CTF directly
+        try:
+            gas_estimate = w3.eth.estimate_gas({
+                "from": wallet,        # proxy as msg.sender (it holds the tokens)
+                "to":   CTF_ADDRESS,
+                "data": redeem_calldata,
+            })
+            gas = int(gas_estimate * 1.05) + 100_000  # buffer for factory overhead
+        except Exception as gas_exc:
+            log.error("    gas estimation failed (tx would revert): %s", gas_exc)
+            log.error("    The proxy wallet may lack tokens or the condition may not be resolved on-chain.")
+            return None, nonce
+
+        proxy_call = {
+            "typeCode": 1,
+            "to":       CTF_ADDRESS,
+            "value":    0,
+            "data":     redeem_calldata,
+        }
+        tx = proxy_factory.functions.proxy([proxy_call]).build_transaction({
+            "from":     eoa,
+            "gas":      gas,
+            "gasPrice": w3.eth.gas_price,
+            "nonce":    nonce,
+        })
+        log.debug("    routing via ProxyWalletFactory for proxy %s", wallet)
     else:
-        fn     = ctf.functions.redeemPositions(
+        try:
+            gas_estimate = w3.eth.estimate_gas({
+                "from": wallet,
+                "to":   CTF_ADDRESS,
+                "data": ctf.encode_abi("redeemPositions",
+                                       args=[POLY_USDC_ADDRESS, parent, cond_b, redeemable]),
+            })
+            gas = int(gas_estimate * 1.05) + 60_000
+        except Exception as gas_exc:
+            log.error("    gas estimation failed (tx would revert): %s", gas_exc)
+            return None, nonce
+
+        tx = ctf.functions.redeemPositions(
             POLY_USDC_ADDRESS, parent, cond_b, redeemable
-        )
-        sender = wallet
+        ).build_transaction({
+            "from":     wallet,
+            "gas":      gas,
+            "gasPrice": w3.eth.gas_price,
+            "nonce":    nonce,
+        })
 
-    try:
-        gas = fn.estimate_gas({"from": sender}) + 60_000
-    except Exception as gas_exc:
-        log.error("    gas estimation failed (tx would revert): %s", gas_exc)
-        log.error("    Possible causes:")
-        log.error("      1. The signing EOA is not the proxy owner — check owner() on Polygonscan.")
-        log.error("      2. The EOA has no POL for gas — fund %s with ~0.5 POL.", sender)
-        return None, nonce
-
-    tx = fn.build_transaction({
-        "from":     sender,
-        "gas":      gas,
-        "gasPrice": w3.eth.gas_price,
-        "nonce":    nonce,
-    })
     signed = account.sign_transaction(tx)
 
     # web3.py ≥6 uses .raw_transaction; fall back to .rawTransaction for older
@@ -446,7 +488,7 @@ def redeem_condition(
 
 # ── One full redemption cycle ─────────────────────────────────────────────────
 
-def run_once(w3: Web3, ctf, account: Account, wallet: str | None = None) -> None:
+def run_once(w3: Web3, ctf, proxy_factory, account: Account, wallet: str | None = None) -> None:
     wallet = wallet or account.address
     log.info("── Scanning wallet %s ──", wallet)
 
@@ -485,7 +527,7 @@ def run_once(w3: Web3, ctf, account: Account, wallet: str | None = None) -> None
 
     for cond_id, tok_map in by_condition.items():
         tx_hash, nonce = redeem_condition(
-            w3, ctf, account, cond_id, tok_map, nonce, token_to_market, wallet,
+            w3, ctf, proxy_factory, account, cond_id, tok_map, nonce, token_to_market, wallet,
             api_confirmed=True,
         )
         if tx_hash:
@@ -539,7 +581,9 @@ def main() -> None:
 
     log.info("Connected to Polygon (chain_id=%s)", w3.eth.chain_id)
 
-    ctf = w3.eth.contract(address=CTF_ADDRESS, abi=CTF_ABI)
+    ctf           = w3.eth.contract(address=CTF_ADDRESS,           abi=CTF_ABI)
+    proxy_factory = w3.eth.contract(address=PROXY_FACTORY_ADDRESS, abi=PROXY_FACTORY_ABI)
+    exchange      = w3.eth.contract(address=EXCHANGE_ADDRESS,      abi=EXCHANGE_ABI)
 
     # ── Startup diagnostics ───────────────────────────────────────────────────
     eoa = account.address
@@ -554,30 +598,27 @@ def main() -> None:
         )
 
     if wallet_address.lower() != eoa.lower():
-        # Proxy mode — verify the EOA is an authorised owner of the Gnosis Safe proxy
-        proxy_contract = w3.eth.contract(address=wallet_address, abi=PROXY_ABI)
+        # Proxy mode — verify the factory maps this EOA to the configured wallet
         try:
-            authorized = proxy_contract.functions.isOwner(eoa).call()
-            if authorized:
-                log.info("  Proxy    : %s  isOwner(EOA)=True ✓", wallet_address)
+            derived = exchange.functions.getPolyProxyWalletAddress(eoa).call()
+            if derived.lower() == wallet_address.lower():
+                log.info("  Proxy    : %s  (confirmed via exchange ✓)", wallet_address)
             else:
-                try:
-                    owners = proxy_contract.functions.getOwners().call()
-                except Exception:
-                    owners = ["(could not fetch)"]
                 log.error(
-                    "  ✗ EOA not authorised on proxy — isOwner(%s)=False. "
-                    "Proxy owners: %s. "
-                    "Set POLY_PRIVATE_KEY to the private key for one of those addresses.",
-                    eoa, owners,
+                    "  ✗ Proxy mismatch — exchange maps EOA %s → %s, "
+                    "but POLY_FUNDER_ADDRESS is %s. "
+                    "Update POLY_FUNDER_ADDRESS or use the correct POLY_PRIVATE_KEY.",
+                    eoa, derived, wallet_address,
                 )
+                wallet_address = derived   # auto-correct
+                log.info("  Auto-corrected wallet to %s", wallet_address)
         except Exception as exc:
-            log.warning("  Could not verify proxy ownership: %s", exc)
+            log.warning("  Could not verify proxy via exchange: %s", exc)
     log.info("─" * 55)
 
     while True:
         try:
-            run_once(w3, ctf, account, wallet_address)
+            run_once(w3, ctf, proxy_factory, account, wallet_address)
         except KeyboardInterrupt:
             log.info("Interrupted — exiting.")
             sys.exit(0)
