@@ -68,6 +68,26 @@ GAMMA_API = "https://gamma-api.polymarket.com"  # market metadata
 REDEEM_INTERVAL_S = int(os.getenv("REDEEM_INTERVAL_S", str(5 * 60)))  # 5 min default
 HTTP_TIMEOUT      = 20  # seconds per API call
 
+# ── Polymarket proxy wallet ABI (minimal) ────────────────────────────────────
+# Each Polymarket user has a proxy wallet smart contract.  The EOA calls
+# proxy.execute(to, value, data) which forwards the call on behalf of the proxy.
+PROXY_ABI = [
+    {
+        "inputs": [
+            {"internalType": "address", "name": "_to",    "type": "address"},
+            {"internalType": "uint256", "name": "_value", "type": "uint256"},
+            {"internalType": "bytes",   "name": "_data",  "type": "bytes"},
+        ],
+        "name": "execute",
+        "outputs": [
+            {"internalType": "bool",  "name": "success",    "type": "bool"},
+            {"internalType": "bytes", "name": "returnData", "type": "bytes"},
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+
 # ── CTF ABI (only the functions we need) ──────────────────────────────────────
 CTF_ABI = [
     # redeemPositions(collateralToken, parentCollectionId, conditionId, indexSets)
@@ -360,17 +380,36 @@ def redeem_condition(
         return None, nonce
 
     # Build redeemPositions transaction
-    parent = b"\x00" * 32
-    fn     = ctf.functions.redeemPositions(
-        POLY_USDC_ADDRESS, parent, cond_b, redeemable
-    )
+    parent   = b"\x00" * 32
+    eoa      = account.address
+    use_proxy = wallet.lower() != eoa.lower()
+
+    if use_proxy:
+        # The CTF tokens are held by the proxy wallet contract.
+        # The EOA calls proxy.execute(CTF, 0, redeemPositions calldata).
+        redeem_calldata = ctf.encode_abi(
+            "redeemPositions",
+            args=[POLY_USDC_ADDRESS, parent, cond_b, redeemable],
+        )
+        proxy   = w3.eth.contract(
+            address=Web3.to_checksum_address(wallet), abi=PROXY_ABI
+        )
+        fn      = proxy.functions.execute(CTF_ADDRESS, 0, redeem_calldata)
+        sender  = eoa
+        log.debug("    routing via proxy wallet %s", wallet)
+    else:
+        fn     = ctf.functions.redeemPositions(
+            POLY_USDC_ADDRESS, parent, cond_b, redeemable
+        )
+        sender = wallet
+
     try:
-        gas = fn.estimate_gas({"from": wallet}) + 60_000
+        gas = fn.estimate_gas({"from": sender}) + 60_000
     except Exception:
         gas = 350_000
 
     tx = fn.build_transaction({
-        "from":     wallet,
+        "from":     sender,
         "gas":      gas,
         "gasPrice": w3.eth.gas_price,
         "nonce":    nonce,
