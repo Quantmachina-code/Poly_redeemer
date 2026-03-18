@@ -69,27 +69,34 @@ REDEEM_INTERVAL_S = int(os.getenv("REDEEM_INTERVAL_S", str(5 * 60)))  # 5 min de
 HTTP_TIMEOUT      = 20  # seconds per API call
 
 # ── Polymarket proxy wallet ABI (minimal) ────────────────────────────────────
-# Each Polymarket user has a proxy wallet smart contract.  The EOA calls
-# proxy.execute(to, value, data) which forwards the call on behalf of the proxy.
+# Polymarket proxy wallets are Gnosis Safe-based contracts deployed by the
+# factory at 0x7BC41F2E80AaF83f971ED557F0C277E4Aa9054A7.
+# execute() takes 4 args (to, value, data, operation); operation=0 is a CALL.
 PROXY_ABI = [
     {
         "inputs": [
-            {"internalType": "address", "name": "_to",    "type": "address"},
-            {"internalType": "uint256", "name": "_value", "type": "uint256"},
-            {"internalType": "bytes",   "name": "_data",  "type": "bytes"},
+            {"internalType": "address", "name": "to",        "type": "address"},
+            {"internalType": "uint256", "name": "value",     "type": "uint256"},
+            {"internalType": "bytes",   "name": "data",      "type": "bytes"},
+            {"internalType": "uint8",   "name": "operation", "type": "uint8"},
         ],
         "name": "execute",
-        "outputs": [
-            {"internalType": "bool",  "name": "success",    "type": "bool"},
-            {"internalType": "bytes", "name": "returnData", "type": "bytes"},
-        ],
+        "outputs": [],
         "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    # Gnosis Safe owner checks
+    {
+        "inputs": [{"internalType": "address", "name": "owner", "type": "address"}],
+        "name": "isOwner",
+        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+        "stateMutability": "view",
         "type": "function",
     },
     {
         "inputs": [],
-        "name": "owner",
-        "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+        "name": "getOwners",
+        "outputs": [{"internalType": "address[]", "name": "", "type": "address[]"}],
         "stateMutability": "view",
         "type": "function",
     },
@@ -399,7 +406,7 @@ def redeem_condition(
         proxy   = w3.eth.contract(
             address=Web3.to_checksum_address(wallet), abi=PROXY_ABI
         )
-        fn      = proxy.functions.execute(CTF_ADDRESS, 0, redeem_calldata)
+        fn      = proxy.functions.execute(CTF_ADDRESS, 0, redeem_calldata, 0)  # operation=0 → CALL
         sender  = eoa
         log.debug("    routing via proxy wallet %s", wallet)
     else:
@@ -547,26 +554,25 @@ def main() -> None:
         )
 
     if wallet_address.lower() != eoa.lower():
-        # Proxy mode — verify the EOA is the authorised owner of the proxy
+        # Proxy mode — verify the EOA is an authorised owner of the Gnosis Safe proxy
+        proxy_contract = w3.eth.contract(address=wallet_address, abi=PROXY_ABI)
         try:
-            proxy_contract = w3.eth.contract(
-                address=wallet_address, abi=PROXY_ABI
-            )
-            proxy_owner = proxy_contract.functions.owner().call()
-            if proxy_owner.lower() == eoa.lower():
-                log.info(
-                    "  Proxy    : %s  owner=EOA ✓", wallet_address
-                )
+            authorized = proxy_contract.functions.isOwner(eoa).call()
+            if authorized:
+                log.info("  Proxy    : %s  isOwner(EOA)=True ✓", wallet_address)
             else:
+                try:
+                    owners = proxy_contract.functions.getOwners().call()
+                except Exception:
+                    owners = ["(could not fetch)"]
                 log.error(
-                    "  ✗ PROXY OWNER MISMATCH — proxy owner is %s "
-                    "but signing EOA is %s. "
-                    "execute() will revert until you set POLY_PRIVATE_KEY "
-                    "to the private key for %s.",
-                    proxy_owner, eoa, proxy_owner,
+                    "  ✗ EOA not authorised on proxy — isOwner(%s)=False. "
+                    "Proxy owners: %s. "
+                    "Set POLY_PRIVATE_KEY to the private key for one of those addresses.",
+                    eoa, owners,
                 )
         except Exception as exc:
-            log.warning("  Could not read proxy owner(): %s", exc)
+            log.warning("  Could not verify proxy ownership: %s", exc)
     log.info("─" * 55)
 
     while True:
